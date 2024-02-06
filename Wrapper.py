@@ -3,6 +3,7 @@ import os.path as osp
 import numpy as np
 from natsort import natsorted
 from tqdm import tqdm
+import scipy.optimize
 
 
 def read_images(data_dir):
@@ -42,15 +43,6 @@ def find_world_coords(length, width, square_size):
     :rtype: numpy.ndarray
     """
     world_coords_x, world_coords_y = np.meshgrid(range(length), range(width))
-
-    ########## Sanity check ##########
-    # print("World Coordinates X:")
-    # print(world_coords_x)
-    # print(f"World Coordinates X Shape: {world_coords_x.shape}\n")
-    # print("World Coordinates Y:") 
-    # print(world_coords_y)
-    ########## Sanity check ##########
-
     world_coords = np.hstack((world_coords_x.reshape(-1, 1), world_coords_y.reshape(-1, 1)))
     # print(f"World Coordinates Shape: {world_coords.shape}")
     world_coords = world_coords * square_size
@@ -72,17 +64,18 @@ def find_checkerboard_coords(images, pattern_size, data_dir):
     :rtype: list
     """
     corners = []
-    results_dir = osp.join(data_dir, "Results")
+    results_dir = osp.join("Results", "Detected_Corners")
     if not osp.exists(results_dir): os.makedirs(results_dir)
 
     pbar = tqdm(enumerate(images), total=len(images), desc="Detecting Corners")
     for ind, image in pbar:
+        image_copy = image[1].copy()
         ret, corner = cv2.findChessboardCorners(image[2], pattern_size, None)
         if ret:
             corner = np.squeeze(corner)
             # Save the image with the corners drawn
-            cv2.drawChessboardCorners(image[1], pattern_size, corner, ret)
-            cv2.imwrite(osp.join(results_dir, image[0]), image[1])
+            cv2.drawChessboardCorners(image_copy, pattern_size, corner, ret)
+            cv2.imwrite(osp.join(results_dir, image[0]), image_copy)
         else:
             continue
 
@@ -150,19 +143,14 @@ def compute_b_vector(homography_matrices):
         v12 = compute_vij(H.T, 0, 1).T
         v22 = compute_vij(H.T, 1, 1).T
         v = np.vstack((v12, (v11 - v22)))
-        # print(f"Shape of v for image {homography_info[0]} --> {v.shape}")
         V.append(v)
 
     # Convert V to numpy array of shape (2 * len(homography_matrices), 6)
     V = np.array(V).reshape(-1, 6)
-    print(f"Shape of V: {V.shape}")
 
     # Compute the b vector
     U, S, Vt = np.linalg.svd(V, full_matrices=True)
     b = Vt[-1, :]
-    # b = Vt.T[:, -1]
-    print(f"Shape of b: {b.shape}")
-    print(f"b: {b}")
 
     return b
 
@@ -177,11 +165,11 @@ def extract_intrinsic_matrix(b):
     :rtype: numpy.ndarray
     """
     v0 = (b[1] * b[3] - b[0] * b[4]) / (b[0] * b[2] - b[1] ** 2) # v0 Prindipal point in y direction
-    arb_scale = b[5] - (b[3] ** 2 + v0 * (b[1] * b[3] - b[0] * b[4])) / b[0] # scale_factorbda
+    arb_scale = b[5] - (b[3] ** 2 + v0 * (b[1] * b[3] - b[0] * b[4])) / b[0] # scale_factor
     u_scale_factor = np.sqrt(arb_scale / b[0]) # alpha
     v_scale_factor = np.sqrt((arb_scale * b[0]) / (b[0] * b[2] - b[1] ** 2)) # beta
     skew = -1 * b[1] * (u_scale_factor ** 2) * v_scale_factor / arb_scale # gamma
-    u0 = (skew * v0 / v_scale_factor) - (b[3] * (u_scale_factor ** 2)) / arb_scale # u0 Prindipal point in x direction
+    u0 = (skew * v0 / v_scale_factor) - (b[3] * (u_scale_factor ** 2)) / arb_scale # u0 Principal point in x direction
 
     # Intrinsic matrix
     K = np.array([
@@ -219,6 +207,91 @@ def extract_extrinsic_matrix(K, homography_matrices):
         R.append([homography_info[0], coord_transform_matrix])
     return R
 
+
+def get_optimization_parameters(A, distortion_vec):
+    return np.array([A[0][0], A[0][1], A[1][1], A[0][2], A[1][2], distortion_vec.flatten()[0], distortion_vec.flatten()[1]])
+
+
+def objective_function(x0, R, world_coords, img_corners):
+    total_error, _, _ = compute_projection_error(x0, R, world_coords, img_corners)
+    return total_error
+
+def compute_projection_error(x0, R, world_coords, img_corners):
+    u0 = x0[3]
+    v0 = x0[4]
+    k1 = x0[5]
+    k2 = x0[6]
+
+    # Compute the intrinsic matrix
+    A = np.array([
+        [x0[0], x0[1], u0],
+        [0, x0[2], v0],
+        [0, 0, 1]
+    ])
+
+    total_error = 0
+    all_reprojected_corners = []
+    individual_img_errors = []
+
+    for i, corner_info in enumerate(img_corners):
+        image_name = corner_info[0]
+        extrinsic_matrix = R[i][1]
+        image_error= 0
+        reprojected_corners = []
+
+        total_transformation_matrix = A @ extrinsic_matrix
+
+        for j, corner in enumerate(corner_info[1]):
+
+            # Fetch the ground truth image coordinates
+            image_gt_corner = corner.reshape(-1, 1)
+            image_gt_corner = np.vstack((image_gt_corner, 1))
+
+            # Convert the world coordinates to homogeneous coordinates
+            world_coord = np.hstack((world_coords[j], 1)).reshape(-1, 1)
+
+            # Camera coordinate
+            camera_coord = extrinsic_matrix @ world_coord
+            x = camera_coord[0] / camera_coord[2]
+            y = camera_coord[1] / camera_coord[2]
+
+            # Pixel coordinate
+            pixel_coord = total_transformation_matrix @ world_coord
+            u = pixel_coord[0] / pixel_coord[2]
+            v = pixel_coord[1] / pixel_coord[2]
+
+            u_hat = u + (u - u0) * (k1 * (x**2 + y**2) + k2 * (x**2 + y**2)**2)
+            v_hat = v + (v - v0) * (k1 * (x**2 + y**2) + k2 * (x**2 + y**2)**2)
+
+            image_projected_corner = np.array([u_hat, v_hat]).reshape(-1, 1)
+            image_projected_corner = np.vstack((image_projected_corner, 1))
+
+            reprojected_corners.append(image_projected_corner)
+
+            image_error += np.linalg.norm(image_projected_corner - image_gt_corner, ord=2)
+        
+        individual_img_errors.append([image_name, image_error/len(corner_info[1])])
+        total_error += image_error
+        all_reprojected_corners.append(reprojected_corners)
+
+    # return np.array(total_error)
+    return np.array([total_error, 0, 0, 0, 0, 0, 0]), all_reprojected_corners, individual_img_errors
+
+
+def undistort_image(image, A, distortion):
+    dist = distortion
+    h, w = image.shape[:2]
+    new_camera_matrix, roi = cv2.getOptimalNewCameraMatrix(A, dist, (w, h), 1, (w, h))
+
+    dst = cv2.undistort(image, A, dist)
+    return dst
+
+def log_error(error):
+    with open("error_logs.txt", "w") as f:
+        for err in error:
+            f.write(f"{err[0]}: Before Error: {err[1]}, After Error: {err[2]}\n") 
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-d", "--data", default="Data", help="Path to calibration images")
@@ -243,43 +316,73 @@ def main():
     # Find the checkerboard corners for images in dataset
     img_corners = find_checkerboard_coords(calibration_images, PATTERN_SIZE, data)
 
-    # ######### Sanity check ##########
-    # for ind, corner_info in enumerate(img_corners):
-    #     image_name = corner_info[0]
-    #     if image_name == calibration_images[ind][0]:
-    #         print(f"Image number = {ind + 1}")
-    #         print(f"Mapping is correct for image {image_name}")
-    #         print(f"Corners detected for image {image_name}: {corner_info[1].shape}\n")
-    #         if ind == len(img_corners) - 1: print(f"Corner matrix: {corner_info[1]}")
-    # ######### Sanity check ##########
-
     # Find homography matrices for the images
     homography_matrices = find_homography_matrices(img_corners, world_coordinates)
-
-
-    # ########## Sanity check ##########
-    # print(f"Number of homography matrices: {len(homography_matrices)}")
-    # for ind, homography_info in enumerate(homography_matrices):
-    #     image_name = homography_info[0]
-    #     if image_name == calibration_images[ind][0]:
-    #         print(f"Image number = {ind + 1}")
-    #         print(f"Mapping is correct for image {image_name}")
-    #         print(f"Homography matrix for image {image_name}: {homography_info[1]} with shape {homography_info[1].shape}\n")
-    # ########## Sanity check ##########
 
     # Compute the B matrix
     vec_b = compute_b_vector(homography_matrices)
 
     # Compute intrinsic matrix
-    K = extract_intrinsic_matrix(vec_b)
-    print(K)
+    A = extract_intrinsic_matrix(vec_b)
+    print(f"Initial Intrinsic Matrix:\n{A}\n")
 
     # Compute the extrinsic matrix
-    R = extract_extrinsic_matrix(K, homography_matrices)
+    R = extract_extrinsic_matrix(A, homography_matrices) # Format: [[img_name, extrinsic_matrix], [img_name, extrinsic_matrix], ...]
 
+    # Initial distortion estimates
+    distortion = np.array([0, 0]).reshape(-1, 1)
 
+    # Get optimization params:
+    x0 = get_optimization_parameters(A, distortion)
+    print(f"Initial Optimization Parameters: {x0}\n")
 
+    x = scipy.optimize.least_squares(fun=objective_function, x0=x0, method="lm", args=(R, world_coordinates, img_corners), verbose=2)
 
+    print(f"Optimized Parameters: {x.x}")
+    _u_scale_factor, _arb_scale, _v_scale_factor, _u0, _v0, _k1, _k2 = x.x
+
+    print(f"Distortion Coefficients: {_k1}, {_k2} ")
+
+    # Compute the optimized intrinsic matrix
+    A_optimized = np.array([
+        [_u_scale_factor, _arb_scale, _u0],
+        [0, _v_scale_factor, _v0],
+        [0, 0, 1]
+    ])
+
+    distortion_optimized = np.array([_k1, _k2, 0, 0, 0])
+    print(f"Optimized Intrinsic Matrix:\n{A_optimized}")
+
+    # Compute before and after reprojection error for individual images
+    before_reprojection_error, _, before_individual_image_error = compute_projection_error(x0, R, world_coordinates, img_corners)
+    print(f"Before Reprojection Error: {before_reprojection_error[0]}")
+    after_reprojection_error, reprojected_points, after_individual_image_error = compute_projection_error(x.x, R, world_coordinates, img_corners)
+    print(f"After Reprojection Error: {after_reprojection_error[0]}")
+
+    # Visualize the reprojected corners using cv2.undistor
+    results_dir = osp.join("Results", "Reprojected_Corners")
+    if not osp.exists(results_dir): os.makedirs(results_dir)
+
+    for i, img_info in tqdm(enumerate(calibration_images)):
+        img_name = img_info[0]
+        img_copy = img_info[1].copy()
+        reprojected_img = undistort_image(img_copy, A_optimized, distortion_optimized)
+        
+        for corner in reprojected_points[i]:
+            # cv2.circle(reprojected_img, (int(corner[0]), int(corner[1])), 5, (0, 255, 0), -2)
+            # Change the circle size to a lsrger radius without a solid fill
+            cv2.circle(reprojected_img, (int(corner[0]), int(corner[1])), 11, (0, 255, 0), 4)
+            cv2.circle(reprojected_img, (int(corner[0]), int(corner[1])), 3, (255, 0, 255), -1)
+
+        cv2.imwrite(osp.join(results_dir, img_name), reprojected_img)
+    
+    # Print the reprojection error for each image
+    error_logs = []
+    for i, error in enumerate(before_individual_image_error):
+        error_logs.append([error[0], error[1], after_individual_image_error[i][1]])
+
+    # Log the error
+    log_error(error_logs)
 
 if __name__ == "__main__":
     main()
