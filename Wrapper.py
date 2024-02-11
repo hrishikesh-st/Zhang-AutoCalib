@@ -342,8 +342,6 @@ def undistort_image(image, A, distortion):
     """
     dist = distortion
     h, w = image.shape[:2]
-    new_camera_matrix, roi = cv2.getOptimalNewCameraMatrix(A, dist, (w, h), 1, (w, h))
-
     dst = cv2.undistort(image, A, dist)
     return dst
 
