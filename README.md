@@ -9,7 +9,7 @@ Details of the project can be found [here](https://rbe549.github.io/spring2024/h
 This project, AutoCalib, is aimed at estimating the intrinsic and extrinsic parameters of a camera using a checkerboard pattern for calibration. Following the seminal work by [Zhengyou Zhang](https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/tr98-71.pdf) , it involves capturing images of a checkerboard, detecting corners, estimating initial parameters, and refining these estimates through non-linear optimization.
 
 ### Data:
-The data for this project is available [here](https://drive.google.com/file/d/1n5eKm-CCYSiu1r84wfgEtDrWBQTc0kTu/view?usp=sharing)
+The data can be found [here](https://drive.google.com/file/d/1n5eKm-CCYSiu1r84wfgEtDrWBQTc0kTu/view?usp=sharing)
 
 #### Steps to run the code:
 
